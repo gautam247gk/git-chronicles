@@ -272,3 +272,24 @@ fn edge_first_seen_survives_delete_and_readd() {
     assert_eq!(a.edge_first_seen[&("a.ts".to_string(), "b.ts".to_string())], 0);
     assert_eq!(a.commits.iter().map(|c| c.edges).collect::<Vec<_>>(), [1, 0, 1]);
 }
+
+#[test]
+fn test_and_example_directories_are_not_orphans() {
+    let mut f = Fixture::new();
+    f.write("test/a.test.js", "1\n");
+    f.write("test/Route.js", "1\n");
+    f.write("tests/b.py", "x = 1\n");
+    f.write("__tests__/c.ts", "export {}\n");
+    f.write("examples/demo/app.js", "1\n");
+    f.write("src/real_orphan.js", "1\n");
+    f.commit("Alice", "layout");
+    let a = run(&f, "commit");
+    let orphans: Vec<&str> = a
+        .head
+        .nodes
+        .iter()
+        .filter(|n| n.orphan)
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(orphans, ["src/real_orphan.js"]);
+}

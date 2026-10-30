@@ -265,8 +265,10 @@ fn resolve_ts(from: &str, spec: &str, idx: &Index) -> Vec<String> {
         // TS ESM convention: `./a.js` refers to `a.ts`
         cands.extend(["ts", "tsx", "mts", "cts"].iter().map(|e| format!("{stem}.{e}")));
     }
-    cands.extend(TS_EXTS.iter().map(|e| format!("{base}.{e}")));
-    cands.extend(TS_EXTS.iter().map(|e| format!("{base}/index.{e}")));
+    if !base.is_empty() {
+        cands.extend(TS_EXTS.iter().map(|e| format!("{base}.{e}")));
+    }
+    cands.extend(TS_EXTS.iter().map(|e| join(&base, &format!("index.{e}"))));
     cands.into_iter().find(|c| idx.has(c)).into_iter().collect()
 }
 

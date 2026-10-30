@@ -160,3 +160,13 @@ fn rust_resolves_mod_crate_super_self() {
     assert_eq!(r("src/a/inner.rs", "super::Y"), ["src/a.rs"]);
     assert!(r("src/c.rs", "crate::nothere::X").is_empty());
 }
+
+#[test]
+fn ts_resolves_directory_imports_at_the_repo_root() {
+    let i = idx(&["index.js", "lib/index.js", "src/x.ts", "src/index.ts"]);
+    let r = |from: &str, s: &str| resolve(Lang::Ts, from, &imp(s, &[]), &i);
+    assert_eq!(r("test/app.js", "../"), ["index.js"]);
+    assert_eq!(r("test/app.js", ".."), ["index.js"]);
+    assert_eq!(r("src/x.ts", "."), ["src/index.ts"]);
+    assert_eq!(r("test/app.js", "../lib"), ["lib/index.js"]);
+}

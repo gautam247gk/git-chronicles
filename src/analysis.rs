@@ -32,6 +32,7 @@ const DEFAULT_ENTRYPOINT_NAMES: [&str; 12] = [
     "__main__.py",
     "setup.py",
 ];
+const ENTRYPOINT_DIRS: [&str; 6] = ["test", "tests", "__tests__", "spec", "examples", "example"];
 const MAX_AUTO_SAMPLES: usize = 300;
 const MAX_BLOB_BYTES: usize = 2_000_000;
 const SILO_SHARE: f64 = 0.8;
@@ -510,8 +511,7 @@ pub fn analyze(repo: &Repo, cfg: &Config, opts: &Options) -> Result<Analysis> {
             });
             let file = id.rsplit('/').next().unwrap_or(id);
             let conventional = DEFAULT_ENTRYPOINT_NAMES.contains(&file)
-                || id.contains("/tests/")
-                || id.starts_with("tests/")
+                || id.split('/').rev().skip(1).any(|d| ENTRYPOINT_DIRS.contains(&d))
                 || file.starts_with("test_")
                 || file.contains(".test.")
                 || file.contains(".spec.")
