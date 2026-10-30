@@ -234,6 +234,14 @@ impl Repo {
             .collect())
     }
 
+    /// Best common ancestor of two revisions, if any.
+    pub fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        self.run(&["merge-base", a, b])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn resolve(&self, rev: &str) -> Result<String> {
         Ok(self
             .run(&["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?

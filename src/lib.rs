@@ -5,3 +5,4 @@ pub mod dates;
 pub mod git;
 pub mod graph;
 pub mod lang;
+pub mod report;

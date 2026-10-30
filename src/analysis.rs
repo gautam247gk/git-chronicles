@@ -101,6 +101,8 @@ pub struct Sample {
     pub sha: String,
     pub short: String,
     pub author: String,
+    #[serde(skip)]
+    pub email: String,
     pub time: i64,
     pub date: String,
     pub subject: String,
@@ -257,6 +259,58 @@ fn edges_of(state: &BTreeMap<String, Rc<Parsed>>) -> BTreeSet<Edge> {
     out
 }
 
+struct Filter {
+    ignore: GlobSet,
+    include: Option<GlobSet>,
+}
+
+impl Filter {
+    fn new(cfg: &Config, opts: &Options) -> Result<Filter> {
+        let mut ignore: Vec<String> = DEFAULT_IGNORES.iter().map(|s| s.to_string()).collect();
+        ignore.extend(cfg.project.ignore.iter().cloned());
+        ignore.extend(opts.exclude.iter().cloned());
+        let include = if opts.paths.is_empty() {
+            None
+        } else {
+            Some(globset(&opts.paths)?)
+        };
+        Ok(Filter {
+            ignore: globset(&ignore)?,
+            include,
+        })
+    }
+
+    fn wanted(&self, p: &str) -> bool {
+        lang::lang_of(p).is_some()
+            && !self.ignore.is_match(p)
+            && self.include.as_ref().is_none_or(|i| i.is_match(p))
+    }
+}
+
+/// The import graph of one revision (no history needed).
+pub struct GraphAt {
+    pub files: BTreeSet<String>,
+    pub edges: BTreeSet<(String, String)>,
+    pub cycles: Vec<Vec<String>>,
+}
+
+pub fn graph_at(repo: &Repo, cfg: &Config, opts: &Options, rev: &str) -> Result<GraphAt> {
+    let filter = Filter::new(cfg, opts)?;
+    let mut reader = repo.blob_reader()?;
+    let mut state = BTreeMap::new();
+    for (path, sha) in repo.snapshot(rev)? {
+        if filter.wanted(&path)
+            && let Some(p) = parse_blob(&mut reader, &sha, &path)
+        {
+            state.insert(path, p);
+        }
+    }
+    let edges = edges_of(&state);
+    let files: BTreeSet<String> = state.keys().cloned().collect();
+    let cycles = sccs(&files.iter().cloned().collect::<Vec<_>>(), &edges);
+    Ok(GraphAt { files, edges, cycles })
+}
+
 fn pair(e: &Edge) -> [String; 2] {
     [e.0.clone(), e.1.clone()]
 }
@@ -279,20 +333,8 @@ pub fn analyze(repo: &Repo, cfg: &Config, opts: &Options) -> Result<Analysis> {
     let in_win = |c: &HistCommit| in_window.as_ref().is_none_or(|w| w.contains(&c.sha));
     let tags = repo.tags()?;
 
-    let mut ignore: Vec<String> = DEFAULT_IGNORES.iter().map(|s| s.to_string()).collect();
-    ignore.extend(cfg.project.ignore.iter().cloned());
-    ignore.extend(opts.exclude.iter().cloned());
-    let (ignore, include): (GlobSet, Option<GlobSet>) = (
-        globset(&ignore)?,
-        if opts.paths.is_empty() {
-            None
-        } else {
-            Some(globset(&opts.paths)?)
-        },
-    );
-    let wanted = |p: &str| {
-        lang::lang_of(p).is_some() && !ignore.is_match(p) && include.as_ref().is_none_or(|i| i.is_match(p))
-    };
+    let filter = Filter::new(cfg, opts)?;
+    let wanted = |p: &str| filter.wanted(p);
 
     let window_commits: Vec<&HistCommit> = history.iter().filter(|c| in_win(c)).collect();
     let g = opts
@@ -359,6 +401,7 @@ pub fn analyze(repo: &Repo, cfg: &Config, opts: &Options) -> Result<Analysis> {
             sha: c.sha.clone(),
             short: c.sha.chars().take(7).collect(),
             author: c.author.clone(),
+            email: c.email.clone(),
             time: c.time,
             date: fmt_date(c.time),
             subject: c.subject.clone(),

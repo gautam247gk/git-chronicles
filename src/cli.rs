@@ -6,11 +6,19 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+/// Path filters shared by every command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct Filters {
+    /// Only analyze paths matching this glob (repeatable).
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+    /// Exclude paths matching this glob (repeatable), on top of default ignores.
+    #[arg(short, long)]
+    pub exclude: Vec<String>,
+}
+
 #[derive(Args, Debug, Clone)]
-pub struct Common {
-    /// Local Git repository path or remote URL (cloned in full into a temp dir).
-    #[arg(default_value = ".")]
-    pub repo: String,
+pub struct Scope {
     /// Branch or revision to walk (first-parent history).
     #[arg(short, long, default_value = "HEAD")]
     pub branch: String,
@@ -23,30 +31,37 @@ pub struct Common {
     /// Sampling: auto, commit, day, week, month or tag [default: config file, else auto].
     #[arg(short, long)]
     pub granularity: Option<String>,
-    /// Only analyze paths matching this glob (repeatable).
-    #[arg(long = "path")]
-    pub paths: Vec<String>,
-    /// Exclude paths matching this glob (repeatable), on top of default ignores.
-    #[arg(short, long)]
-    pub exclude: Vec<String>,
+    #[command(flatten)]
+    pub filters: Filters,
 }
 
-impl Common {
+#[derive(Args, Debug, Clone)]
+pub struct Common {
+    /// Local Git repository path or remote URL (cloned in full into a temp dir).
+    #[arg(default_value = ".")]
+    pub repo: String,
+    #[command(flatten)]
+    pub scope: Scope,
+}
+
+impl Scope {
     pub fn options(&self) -> Result<Options> {
         Ok(Options {
             rev: self.branch.clone(),
             since: self.since.clone(),
             until: self.until.clone(),
             granularity: self.granularity.as_deref().map(Granularity::parse).transpose()?,
-            paths: self.paths.clone(),
-            exclude: self.exclude.clone(),
+            paths: self.filters.paths.clone(),
+            exclude: self.filters.exclude.clone(),
         })
     }
+}
 
+impl Common {
     pub fn run(&self) -> Result<(Analysis, Config)> {
         let opened = open(&self.repo)?;
         let cfg = Config::load(opened.repo.dir())?;
-        let a = analyze(&opened.repo, &cfg, &self.options()?)?;
+        let a = analyze(&opened.repo, &cfg, &self.scope.options()?)?;
         Ok((a, cfg))
     }
 }

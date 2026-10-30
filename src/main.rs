@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
-use git_chronicle::cli::Common;
+use clap::{Args, Parser, Subcommand};
+use git_chronicle::analysis::{Granularity, Options, analyze};
+use git_chronicle::cli::{Common, Filters, open};
+use git_chronicle::config::Config;
+use git_chronicle::report::{self, build_audit, render_audit, render_pr_diff};
 
 #[derive(Parser)]
 #[command(
@@ -16,7 +19,7 @@ struct Cli {
     view: ViewArgs,
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 struct ViewArgs {
     #[command(flatten)]
     common: Common,
@@ -26,19 +29,128 @@ struct ViewArgs {
 }
 
 #[derive(Subcommand)]
-enum Cmd {}
+enum Cmd {
+    /// Check HEAD for import cycles, forbidden edges and bus-factor risk (non-zero exit for CI).
+    Audit {
+        #[command(flatten)]
+        common: Common,
+        /// Output format: table, json, markdown or sarif.
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Exit 1 if any import cycle exists at HEAD.
+        #[arg(long)]
+        fail_on_cycles: bool,
+        /// Exit 1 if any `forbidden_edges` rule from .chroniclerc.toml is violated.
+        #[arg(long)]
+        fail_on_forbidden: bool,
+        /// Exit 1 if more than N files are bus-factor risks.
+        #[arg(long, value_name = "N")]
+        max_bus_factor_risk: Option<usize>,
+    },
+    /// Compare the dependency graph of two refs (PR architecture diff).
+    PrDiff {
+        base: String,
+        head: String,
+        #[arg(default_value = ".")]
+        repo: String,
+        /// Output format: markdown or json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Exit 1 if the branch introduces a new import cycle.
+        #[arg(long)]
+        fail_on_cycles: bool,
+        /// Exit 1 if the branch introduces a forbidden edge.
+        #[arg(long)]
+        fail_on_forbidden: bool,
+        #[command(flatten)]
+        filters: Filters,
+    },
+    /// Find the commit where SOURCE first imported TARGET.
+    BlameEdge {
+        source: String,
+        target: String,
+        #[arg(default_value = ".")]
+        repo: String,
+        /// Branch or revision to search.
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+        #[command(flatten)]
+        filters: Filters,
+    },
+}
 
 fn main() {
-    if let Err(e) = run(Cli::parse()) {
-        eprintln!("error: {e:#}");
-        std::process::exit(2);
+    match run(Cli::parse()) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(2);
+        }
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+/// Returns the process exit code (1 = a requested check failed).
+fn run(cli: Cli) -> Result<i32> {
     match cli.cmd {
-        Some(c) => match c {},
-        None => default_cmd(cli.view),
+        None => default_cmd(cli.view).map(|()| 0),
+        Some(Cmd::Audit {
+            common,
+            format,
+            fail_on_cycles,
+            fail_on_forbidden,
+            max_bus_factor_risk,
+        }) => {
+            let (a, cfg) = common.run()?;
+            let r = build_audit(a, &cfg)?;
+            print!("{}", render_audit(&r, &format)?);
+            let failed = (fail_on_cycles && !r.cycles.is_empty())
+                || (fail_on_forbidden && !r.forbidden.is_empty())
+                || max_bus_factor_risk.is_some_and(|n| r.bus_factor_risks.len() > n);
+            Ok(i32::from(failed))
+        }
+        Some(Cmd::PrDiff {
+            base,
+            head,
+            repo,
+            format,
+            fail_on_cycles,
+            fail_on_forbidden,
+            filters,
+        }) => {
+            let opened = open(&repo)?;
+            let cfg = Config::load(opened.repo.dir())?;
+            let opts = Options {
+                paths: filters.paths,
+                exclude: filters.exclude,
+                ..Options::default()
+            };
+            let d = report::pr_diff(&opened.repo, &cfg, &opts, &base, &head)?;
+            print!("{}", render_pr_diff(&d, &format)?);
+            let failed = (fail_on_cycles && !d.new_cycles.is_empty())
+                || (fail_on_forbidden && !d.new_forbidden.is_empty());
+            Ok(i32::from(failed))
+        }
+        Some(Cmd::BlameEdge {
+            source,
+            target,
+            repo,
+            branch,
+            filters,
+        }) => {
+            let opened = open(&repo)?;
+            let cfg = Config::load(opened.repo.dir())?;
+            // exact commit attribution needs every commit as its own sample
+            let opts = Options {
+                rev: branch,
+                granularity: Some(Granularity::Commit),
+                paths: filters.paths,
+                exclude: filters.exclude,
+                ..Options::default()
+            };
+            let a = analyze(&opened.repo, &cfg, &opts)?;
+            print!("{}", report::blame_edge(&a, &cfg, &source, &target)?);
+            Ok(0)
+        }
     }
 }
 
