@@ -6,3 +6,4 @@ pub mod git;
 pub mod graph;
 pub mod lang;
 pub mod report;
+pub mod viewer;

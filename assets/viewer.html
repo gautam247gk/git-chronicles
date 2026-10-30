@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>git-chronicle</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--dim:#7d8590;--line:#30363d;--accent:#58a6ff;--cool:#3b82f6;--hot:#ff3b30;--cycle:#ff2bd6}
+body[data-theme=cyberpunk]{--bg:#0a0612;--panel:#150d24;--fg:#f4e9ff;--dim:#8d7aa8;--line:#3a2257;--accent:#00f0ff;--cycle:#ff2bd6}
+body[data-theme=catppuccin]{--bg:#1e1e2e;--panel:#181825;--fg:#cdd6f4;--dim:#9399b2;--line:#45475a;--accent:#89b4fa;--cycle:#f5c2e7}
+body[data-theme=dracula]{--bg:#282a36;--panel:#21222c;--fg:#f8f8f2;--dim:#8b92b8;--line:#44475a;--accent:#bd93f9;--cycle:#ff79c6}
+body[data-theme=minimal-light]{--bg:#ffffff;--panel:#f6f8fa;--fg:#1f2328;--dim:#656d76;--line:#d0d7de;--accent:#0969da;--cool:#2563eb;--hot:#dc2626;--cycle:#c026d3}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 system-ui,sans-serif;height:100vh;display:grid;grid-template-rows:auto 1fr auto;overflow:hidden}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:14px;margin:0}
+.group{display:flex;gap:4px;align-items:center}
+button{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font:inherit;cursor:pointer}
+button:hover,button.on{border-color:var(--accent);color:var(--accent)}
+main{position:relative;min-height:0}
+canvas{width:100%;height:100%;display:block;cursor:grab}
+#inspector{position:absolute;top:8px;right:8px;width:min(320px,calc(100% - 16px));max-height:calc(100% - 16px);overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;display:none}
+#inspector h2{font-size:13px;margin:0 0 6px;word-break:break-all}
+#inspector dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 10px}
+#inspector dt{color:var(--dim)}#inspector dd{margin:0;word-break:break-word}
+#legend{position:absolute;left:8px;bottom:8px;color:var(--dim);font-size:12px;background:color-mix(in srgb,var(--bg) 80%,transparent);padding:2px 6px;border-radius:4px}
+footer{padding:8px 12px;background:var(--panel);border-top:1px solid var(--line);display:grid;gap:6px}
+#scrub{width:100%}
+#ticker{display:flex;flex-wrap:wrap;gap:4px 16px;color:var(--dim)}
+#ticker b{color:var(--fg)}.add{color:#3fb950}.del{color:#f85149}
+#search{display:none;position:absolute;top:8px;left:8px;width:260px;background:var(--panel);color:var(--fg);border:1px solid var(--accent);border-radius:6px;padding:5px 8px;font:inherit}
+.empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">git-chronicle</h1>
+  <div class="group" id="overlays"></div>
+  <div class="group"><button id="play" title="Space">&#9654;</button><button id="prev" title="Left / h">&#9664;</button><button id="next" title="Right / l">&#9654;&#9654;</button>
+    <button id="slower" title="-">&minus;</button><span id="speed">1x</span><button id="faster" title="+">+</button></div>
+</header>
+<main><canvas id="c"></canvas><input id="search" placeholder="Find file&hellip; (Enter)"><div id="inspector"></div><div id="legend"></div><div class="empty" id="empty" hidden>No supported source files in this history.</div></main>
+<footer><input type="range" id="scrub" min="0" value="0"><div id="ticker"></div></footer>
+<script type="application/json" id="data">__CHRONICLE_DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const T = D.timeline, N = T.commits.length;
+document.body.dataset.theme = D.theme;
+document.getElementById("title").textContent = "git-chronicle" + (T.project ? " · " + T.project : "");
+const OVERLAYS = ["architecture", "hotspots", "bus-factor", "cycles", "orphans"];
+const SPEEDS = [0.5, 1, 2, 5, 10, 25, 50, 100];
+const LEGEND = {
+  architecture: "Colour = top-level directory, size = lines of code (LOC from HEAD).",
+  hotspots: "Cool blue → red = hotspot score at HEAD (churn × log10 LOC × fan-in). Metric is HEAD-only.",
+  "bus-factor": "Orange = >80% single author and fan-in ≥ 5 (HEAD authorship). Ring = owner inactive.",
+  cycles: "Magenta = files and edges inside an import cycle at the selected commit.",
+  orphans: "Yellow = no incoming imports and not an entrypoint (nodes absent at HEAD: fan-in 0 only)."
+};
+const css = n => getComputedStyle(document.body).getPropertyValue(n).trim();
+const headNode = new Map(T.head.nodes.map(n => [n.id, n]));
+const maxHot = Math.max(1e-9, ...T.head.nodes.map(n => n.hotspot));
+const tagIdx = T.commits.map((c, i) => c.tags.length ? i : -1).filter(i => i >= 0);
+let overlay = OVERLAYS.includes(D.overlay) ? D.overlay : "architecture";
+
+// ---- state replay: files/edges present at sample i ----
+const key = (a, b) => a + "\u0000" + b;
+let cur = -1, files = new Set(), edges = new Map(), cycleNodes = new Set(), cycleEdges = new Set();
+const genesis = new Map(), edgeBirth = new Map();
+T.graph_deltas.forEach((d, i) => {
+  d.files_added.forEach(f => genesis.has(f) || genesis.set(f, i));
+  d.edges_added.forEach(([a, b]) => edgeBirth.has(key(a, b)) || edgeBirth.set(key(a, b), i));
+});
+function applyDelta(d, sign) {
+  const add = sign > 0;
+  d.files_added.forEach(f => add ? files.add(f) : files.delete(f));
+  d.files_removed.forEach(f => add ? files.delete(f) : files.add(f));
+  d.edges_added.forEach(([a, b]) => add ? edges.set(key(a, b), [a, b]) : edges.delete(key(a, b)));
+  d.edges_removed.forEach(([a, b]) => add ? edges.delete(key(a, b)) : edges.set(key(a, b), [a, b]));
+}
+function seek(i) {
+  i = Math.max(0, Math.min(N - 1, i));
+  if (i < cur) { files = new Set(); edges = new Map(); cur = -1; }
+  while (cur < i) applyDelta(T.graph_deltas[++cur], 1);
+  computeCycles(); syncNodes(); renderTicker(); scrub.value = cur; refreshInspector();
+}
+function computeCycles() {   // iterative Tarjan over the current edges
+  const ids = [...files], ix = new Map(ids.map((f, i) => [f, i])), adj = ids.map(() => []);
+  edges.forEach(([a, b]) => ix.has(a) && ix.has(b) && adj[ix.get(a)].push(ix.get(b)));
+  const idx = Array(ids.length).fill(-1), low = [], on = [], st = [];
+  let n = 0; cycleNodes = new Set(); cycleEdges = new Set();
+  const comp = Array(ids.length).fill(-1); let cc = 0;
+  for (let r = 0; r < ids.length; r++) {
+    if (idx[r] >= 0) continue;
+    const call = [[r, 0]];
+    while (call.length) {
+      const fr = call[call.length - 1], v = fr[0];
+      if (fr[1] === 0 && idx[v] < 0) { idx[v] = low[v] = n++; st.push(v); on[v] = true; }
+      if (fr[1] < adj[v].length) {
+        const w = adj[v][fr[1]++];
+        if (idx[w] < 0) call.push([w, 0]); else if (on[w]) low[v] = Math.min(low[v], idx[w]);
+        continue;
+      }
+      call.pop();
+      if (call.length) { const p = call[call.length - 1][0]; low[p] = Math.min(low[p], low[v]); }
+      if (low[v] === idx[v]) {
+        const m = []; let w;
+        do { w = st.pop(); on[w] = false; comp[w] = cc; m.push(w); } while (w !== v);
+        if (m.length > 1) m.forEach(x => cycleNodes.add(ids[x])); cc++;
+      }
+    }
+  }
+  edges.forEach(([a, b], k) => { if (cycleNodes.has(a) && cycleNodes.has(b) && comp[ix.get(a)] === comp[ix.get(b)]) cycleEdges.add(k); });
+}
+
+// ---- layout ----
+const pos = new Map(); let nodes = [];
+const hash = s => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return Math.abs(h); };
+const moduleOf = f => f.includes("/") ? f.split("/")[0] : "(root)";
+function syncNodes() {
+  nodes = [...files].map(id => {
+    let p = pos.get(id);
+    if (!p) {  // spawn near a neighbour so new files grow out of the graph
+      let nb = null; edges.forEach(([a, b]) => { if (!nb && (a === id && pos.has(b))) nb = pos.get(b); else if (!nb && b === id && pos.has(a)) nb = pos.get(a); });
+      const a = (hash(id) % 628) / 100;
+      p = { x: (nb ? nb.x : 0) + Math.cos(a) * 30, y: (nb ? nb.y : 0) + Math.sin(a) * 30, vx: 0, vy: 0 };
+      pos.set(id, p);
+    }
+    const hn = headNode.get(id);
+    return { id, p, loc: hn ? hn.loc : 0, fanIn: 0, fanOut: 0 };
+  });
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  edges.forEach(([a, b]) => { const x = byId.get(a), y = byId.get(b); if (x && y) { x.fanOut++; y.fanIn++; } });
+  document.getElementById("empty").hidden = nodes.length > 0;
+}
+const radius = n => Math.max(4, Math.log2(Math.max(2, n.loc)) * 1.6);
+function step() {
+  const byId = new Map(nodes.map(n => [n.id, n])), CELL = 90, grid = new Map();
+  nodes.forEach(n => { const k = Math.floor(n.p.x / CELL) + "," + Math.floor(n.p.y / CELL); (grid.get(k) || grid.set(k, []).get(k)).push(n); });
+  nodes.forEach(n => {
+    const gx = Math.floor(n.p.x / CELL), gy = Math.floor(n.p.y / CELL);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) (grid.get((gx + dx) + "," + (gy + dy)) || []).forEach(m => {
+      if (m === n) return;
+      let x = n.p.x - m.p.x, y = n.p.y - m.p.y, d2 = x * x + y * y + 0.01;
+      if (d2 < CELL * CELL) { const f = 900 / d2; n.p.vx += x * f / Math.sqrt(d2) * 0.5; n.p.vy += y * f / Math.sqrt(d2) * 0.5; }
+    });
+    n.p.vx -= n.p.x * 0.002; n.p.vy -= n.p.y * 0.002;   // gentle gravity
+  });
+  edges.forEach(([a, b]) => {
+    const x = byId.get(a), y = byId.get(b); if (!x || !y) return;
+    const dx = y.p.x - x.p.x, dy = y.p.y - x.p.y, d = Math.hypot(dx, dy) || 1, f = (d - 60) * 0.02;
+    x.p.vx += dx / d * f; x.p.vy += dy / d * f; y.p.vx -= dx / d * f; y.p.vy -= dy / d * f;
+  });
+  nodes.forEach(n => { n.p.vx *= 0.82; n.p.vy *= 0.82; n.p.x += n.p.vx; n.p.y += n.p.vy; });
+}
+
+// ---- drawing ----
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let cam = { x: 0, y: 0, k: 1 }, selected = null, lock = false, W = 0, H = 0;
+function resize() { const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1; W = r.width; H = r.height; cv.width = W * d; cv.height = H * d; ctx.setTransform(d, 0, 0, d, 0, 0); }
+addEventListener("resize", resize);
+const toScreen = p => [(p.x - cam.x) * cam.k + W / 2, (p.y - cam.y) * cam.k + H / 2];
+function fit() {
+  if (!nodes.length) return;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  nodes.forEach(n => { x0 = Math.min(x0, n.p.x); x1 = Math.max(x1, n.p.x); y0 = Math.min(y0, n.p.y); y1 = Math.max(y1, n.p.y); });
+  cam = { x: (x0 + x1) / 2, y: (y0 + y1) / 2, k: Math.min(3, 0.85 * Math.min(W / Math.max(40, x1 - x0), H / Math.max(40, y1 - y0))) };
+}
+function lerp(a, b, t) { return a.map((v, i) => Math.round(v + (b[i] - v) * t)); }
+function nodeColor(n) {
+  const hn = headNode.get(n.id);
+  const dim = css("--line");
+  switch (overlay) {
+    case "hotspots": return hn ? "rgb(" + lerp([59, 130, 246], [255, 40, 40], Math.sqrt(hn.hotspot / maxHot)).join() + ")" : dim;
+    case "bus-factor": return hn && hn.silo ? "#ff8c00" : dim;
+    case "cycles": return cycleNodes.has(n.id) ? css("--cycle") : dim;
+    case "orphans": return (hn ? hn.orphan : n.fanIn === 0) ? "#f5d90a" : dim;
+    default: return "hsl(" + (hash(moduleOf(n.id)) % 360) + ",65%,58%)";
+  }
+}
+function draw(t) {
+  ctx.clearRect(0, 0, W, H);
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  ctx.lineWidth = 1;
+  edges.forEach(([a, b], k) => {
+    const x = byId.get(a), y = byId.get(b); if (!x || !y) return;
+    const [x0, y0] = toScreen(x.p), [x1, y1] = toScreen(y.p), cyc = cycleEdges.has(k);
+    if (overlay === "cycles" && cyc) { ctx.globalAlpha = 0.5 + 0.5 * Math.sin(t / 200); ctx.strokeStyle = css("--cycle"); ctx.lineWidth = 2; }
+    else { ctx.globalAlpha = selected && (a === selected || b === selected) ? 0.9 : overlay === "cycles" ? 0.15 : 0.35; ctx.strokeStyle = selected && (a === selected || b === selected) ? css("--accent") : css("--dim"); ctx.lineWidth = 1; }
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+  nodes.forEach(n => {
+    const [x, y] = toScreen(n.p), r = radius(n) * Math.sqrt(cam.k);
+    ctx.fillStyle = nodeColor(n); ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+    const hn = headNode.get(n.id);
+    if (overlay === "bus-factor" && hn && hn.silo && hn.owner_inactive) { ctx.strokeStyle = css("--fg"); ctx.lineWidth = 2; ctx.stroke(); }
+    if (n.id === selected) { ctx.strokeStyle = css("--accent"); ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, r + 4, 0, 6.2832); ctx.stroke(); }
+    if (cam.k > 1.6 || n.id === selected) { ctx.fillStyle = css("--fg"); ctx.font = "11px system-ui"; ctx.fillText(n.id.split("/").pop(), x + r + 3, y + 3); }
+  });
+}
+
+// ---- ticker / inspector ----
+const scrub = document.getElementById("scrub"), ticker = document.getElementById("ticker"), insp = document.getElementById("inspector");
+scrub.max = N - 1;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function renderTicker() {
+  const c = T.commits[cur], loc = c.loc.toLocaleString();
+  ticker.innerHTML = `<span><b>${esc(c.date)}</b> ${esc(c.short)}</span><span>${esc(c.author)}: ${esc(c.subject)}</span>` +
+    `<span><span class=add>+${c.added}</span> <span class=del>&minus;${c.removed}</span></span>` +
+    `<span>${c.files} files · ${loc} LOC · ${c.edges} edges · ${c.cycles} cycles</span>` +
+    (c.commit_count > 1 ? `<span>${c.commit_count} commits in bucket</span>` : "") +
+    (c.tags.length ? `<span>\u{1F3F7} ${c.tags.map(esc).join(", ")}</span>` : "") +
+    `<span>${cur + 1}/${N}</span>`;
+}
+function commitLine(i) { const c = T.commits[i]; return `${esc(c.short)} (${esc(c.date)}) ${esc(c.author)}: ${esc(c.subject)}`; }
+function refreshInspector() {
+  if (!selected) { insp.style.display = "none"; return; }
+  const n = nodes.find(x => x.id === selected);
+  if (!n) { insp.style.display = "block"; insp.innerHTML = `<h2>${esc(selected)}</h2><p>Not present at this commit.</p>`; return; }
+  const hn = headNode.get(n.id), rows = [["Genesis", genesis.has(n.id) ? commitLine(genesis.get(n.id)) : "?"], ["Fan-in / out", n.fanIn + " / " + n.fanOut]];
+  if (hn) rows.push(["LOC (HEAD)", hn.loc], ["Churn (window)", hn.churn], ["Top author", `${esc(hn.top_author)} (${Math.round(hn.author_share * 100)}%)${hn.owner_inactive ? ", inactive" : ""}`], ["Hotspot", hn.hotspot.toFixed(2)], ["Flags", [hn.silo && "bus-factor risk", hn.orphan && "orphan"].filter(Boolean).join(", ") || "none"]);
+  const cy = T.head.cycles.find(c => c.files.includes(n.id));
+  if (cy) rows.push(["Cycle culprit", `${esc(cy.introduced_sha.slice(0, 7))} (${esc(cy.introduced_date)}) ${esc(cy.subject)}`]);
+  const out = [...edges.values()].filter(([a]) => a === n.id).map(([a, b]) => `${esc(b)} <small>(${esc(T.commits[edgeBirth.get(key(a, b))].short)})</small>`);
+  rows.push(["Imports", out.join("<br>") || "none"]);
+  insp.style.display = "block";
+  insp.innerHTML = `<h2>${esc(n.id)}</h2><dl>${rows.map(r => `<dt>${r[0]}</dt><dd>${r[1]}</dd>`).join("")}</dl>`;
+}
+
+// ---- controls ----
+let playing = false, speedI = 1, acc = 0, last = 0;
+const playBtn = document.getElementById("play"), speedEl = document.getElementById("speed");
+function setPlaying(p) { playing = p; playBtn.innerHTML = p ? "&#10074;&#10074;" : "&#9654;"; }
+function setSpeed(i) { speedI = Math.max(0, Math.min(SPEEDS.length - 1, i)); speedEl.textContent = SPEEDS[speedI] + "x"; }
+function setOverlay(o) { overlay = o; document.querySelectorAll("#overlays button").forEach(b => b.classList.toggle("on", b.dataset.o === o)); document.getElementById("legend").textContent = LEGEND[o]; }
+OVERLAYS.forEach((o, i) => { const b = document.createElement("button"); b.dataset.o = o; b.textContent = (i + 1) + " " + o; b.title = "Key " + (i + 1); b.onclick = () => setOverlay(o); document.getElementById("overlays").appendChild(b); });
+function jumpTag(dir) { const t = dir > 0 ? tagIdx.find(i => i > cur) : [...tagIdx].reverse().find(i => i < cur); if (t !== undefined) seek(t); }
+playBtn.onclick = () => setPlaying(!playing);
+document.getElementById("prev").onclick = () => seek(cur - 1);
+document.getElementById("next").onclick = () => seek(cur + 1);
+document.getElementById("slower").onclick = () => setSpeed(speedI - 1);
+document.getElementById("faster").onclick = () => setSpeed(speedI + 1);
+scrub.oninput = () => seek(+scrub.value);
+const search = document.getElementById("search");
+addEventListener("keydown", e => {
+  if (e.target === search) {
+    if (e.key === "Enter") { const q = search.value.toLowerCase(), n = nodes.find(n => n.id.toLowerCase().includes(q)); if (n) { selected = n.id; cam.x = n.p.x; cam.y = n.p.y; refreshInspector(); } search.style.display = "none"; search.blur(); }
+    else if (e.key === "Escape") { search.style.display = "none"; search.blur(); }
+    return;
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === " ") { setPlaying(!playing); e.preventDefault(); }
+  else if (k === "ArrowRight" || k === "l") e.shiftKey ? jumpTag(1) : seek(cur + 1);
+  else if (k === "ArrowLeft" || k === "h") e.shiftKey ? jumpTag(-1) : seek(cur - 1);
+  else if (k === "+" || k === "=") setSpeed(speedI + 1);
+  else if (k === "-") setSpeed(speedI - 1);
+  else if (k >= "1" && k <= "5") setOverlay(OVERLAYS[+k - 1]);
+  else if (k === "/") { search.style.display = "block"; search.value = ""; search.focus(); e.preventDefault(); }
+  else if (k === "f") lock = !lock && !!selected;
+  else if (k === "r") { lock = false; fit(); }
+  else if (k === "q" || k === "Escape") { selected = null; lock = false; refreshInspector(); }
+});
+let drag = null;
+cv.onpointerdown = e => { drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y, moved: false }; cv.setPointerCapture(e.pointerId); cv.style.cursor = "grabbing"; };
+cv.onpointermove = e => { if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y; if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true; if (drag.moved) { lock = false; cam.x = drag.cx - dx / cam.k; cam.y = drag.cy - dy / cam.k; } };
+cv.onpointerup = e => {
+  cv.style.cursor = "grab";
+  if (drag && !drag.moved) {
+    const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    let best = null, bd = 1e9;
+    nodes.forEach(n => { const [x, y] = toScreen(n.p), d = Math.hypot(x - mx, y - my); if (d < bd && d < radius(n) * Math.sqrt(cam.k) + 6) { bd = d; best = n.id; } });
+    selected = best; refreshInspector();
+  }
+  drag = null;
+};
+cv.onwheel = e => { e.preventDefault(); cam.k = Math.max(0.05, Math.min(12, cam.k * (e.deltaY < 0 ? 1.12 : 1 / 1.12))); };
+
+function frame(t) {
+  if (playing) {
+    acc += (t - last) / 1000 * SPEEDS[speedI] * 2;
+    while (acc >= 1) { acc -= 1; if (cur >= N - 1) { setPlaying(false); break; } seek(cur + 1); }
+  }
+  last = t;
+  step(); step();
+  if (lock && selected) { const n = nodes.find(x => x.id === selected); if (n) { cam.x += (n.p.x - cam.x) * 0.1; cam.y += (n.p.y - cam.y) * 0.1; } }
+  draw(t); requestAnimationFrame(frame);
+}
+resize(); setOverlay(overlay); setSpeed(1); seek(N - 1);
+for (let i = 0; i < 400; i++) step();   // settle the initial layout
+fit(); requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

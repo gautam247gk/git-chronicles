@@ -4,6 +4,7 @@ use git_chronicle::analysis::{Granularity, Options, analyze};
 use git_chronicle::cli::{Common, Filters, open};
 use git_chronicle::config::Config;
 use git_chronicle::report::{self, build_audit, render_audit, render_pr_diff};
+use git_chronicle::viewer::{open_browser, render_html, serve};
 
 #[derive(Parser)]
 #[command(
@@ -23,9 +24,21 @@ struct Cli {
 struct ViewArgs {
     #[command(flatten)]
     common: Common,
-    /// Write the timeline to FILE (.json, or "-" for stdout).
+    /// Write the timeline to FILE instead of serving it (.json, .html, or "-" for JSON on stdout).
     #[arg(long, value_name = "FILE")]
     export: Option<String>,
+    /// Viewer colour theme: github-dark, cyberpunk, catppuccin, dracula, minimal-light.
+    #[arg(long)]
+    theme: Option<String>,
+    /// Initial overlay: architecture, hotspots, bus-factor, cycles, orphans.
+    #[arg(short, long, default_value = "architecture")]
+    overlay: String,
+    /// Port for the local viewer server.
+    #[arg(short, long, default_value_t = 4400)]
+    port: u16,
+    /// Do not open the system browser.
+    #[arg(long)]
+    no_open: bool,
 }
 
 #[derive(Subcommand)]
@@ -155,21 +168,31 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 fn default_cmd(v: ViewArgs) -> Result<()> {
-    let Some(out) = &v.export else {
-        bail!("no --export given; the interactive viewer is not built yet")
-    };
-    let ext = out.rsplit_once('.').map(|x| x.1.to_ascii_lowercase());
-    match (out.as_str(), ext.as_deref()) {
-        ("-", _) | (_, Some("json")) => {}
-        (_, Some("mp4" | "webm" | "gif")) => bail!("video/GIF export is not supported; use .json"),
-        _ => bail!("unsupported export format for {out:?}; use .json"),
+    let ext = v
+        .export
+        .as_deref()
+        .and_then(|o| o.rsplit_once('.'))
+        .map(|x| x.1.to_ascii_lowercase());
+    match (v.export.as_deref(), ext.as_deref()) {
+        (None | Some("-"), _) | (_, Some("json" | "html")) => {}
+        (_, Some("mp4" | "webm" | "gif")) => bail!("video/GIF export is not supported; use .html or .json"),
+        (Some(o), _) => bail!("unsupported export format for {o:?}; use .html or .json"),
     }
-    let (analysis, _) = v.common.run()?;
-    let json = serde_json::to_string(&analysis)?;
-    if out == "-" {
-        println!("{json}")
-    } else {
-        std::fs::write(out, json)?
+    let (analysis, cfg) = v.common.run()?;
+    let theme = v.theme.unwrap_or(cfg.export.theme);
+    match v.export.as_deref() {
+        Some("-") => println!("{}", serde_json::to_string(&analysis)?),
+        Some(o) if ext.as_deref() == Some("json") => std::fs::write(o, serde_json::to_string(&analysis)?)?,
+        Some(o) => std::fs::write(o, render_html(&analysis, &theme, &v.overlay)?)?,
+        None => {
+            let html = render_html(&analysis, &theme, &v.overlay)?;
+            serve(&html, v.port, |url| {
+                println!("git-chronicle viewer: {url} (Ctrl-C to stop)");
+                if !v.no_open {
+                    open_browser(url);
+                }
+            })?;
+        }
     }
     Ok(())
 }
